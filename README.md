@@ -1,5 +1,6 @@
 # Prolog Examination Timetabling Problem
-
+## Paper about the solution
+You can read the paper about this solution [here](report.pdf)
 ## Requirements
 
 - SWI-Prolog
