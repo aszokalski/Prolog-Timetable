@@ -1,0 +1,314 @@
+:- use_module(library(csv)).
+:- use_module(library(clpfd)).
+:- use_module(library(random)).
+
+% Configuration ------------------------------------------------------------------
+config(conflict_matrix_file, 'data/conflicts.csv').
+config(course_names_file, 'data/names.csv').
+config(course_number, 80).
+config(slots, 20).
+config(population_size, 8).
+config(crossover_rate, 0.8).
+config(mutation_rate, 0.5).
+config(elitism_rate, 0.1).
+config(generations, 100).
+
+% Logic --------------------------------------------------------------------------
+
+% Conflicts
+:- dynamic conflict/3. % conflict(Course1, Course2, NumStudents)
+
+conflict(Course1, Course2) :-
+    conflict(Course1, Course2, _).
+
+set_conflict(Course1, Course2, NumStudents) :-
+    NumStudents > 0, % Avoid storing unnecessary entries
+    assertz(conflict(Course1, Course2, NumStudents)).
+
+% Model
+specimen(Schedule) :- 
+    config(course_number, NumCourses),
+    config(slots, NumSlots),
+    length(Schedule, NumCourses),
+    Schedule ins 1..NumSlots,
+    all_distinct_if_conflicting(Schedule),
+    random_between(111, 999, Seed),
+    labeling([random_variable(Seed)], Schedule).
+
+% Constraints 
+% H1 - No two conflicting courses can share the same slot
+all_distinct_if_conflicting(Schedule) :-
+    findall((I, J), (conflict(I, J), I < J), ConflictPairs),
+    maplist(enforce_distinct_pair(Schedule), ConflictPairs).
+
+enforce_distinct_pair(Schedule, (I, J)) :-
+    nth1(I, Schedule, SlotI),
+    nth1(J, Schedule, SlotJ),
+    SlotI #\= SlotJ.
+
+% Fitness
+% Minimize the total proximity function of the schedule
+
+proximity(X, I, J, Result) :-
+    conflict(I, J, NumStudents),
+    nth1(I, X, SlotI),
+    nth1(J, X, SlotJ),
+    Result = NumStudents * 2**(5 - max(5, abs(SlotI - SlotJ))).
+
+total_proximity(X, Result) :-
+    findall(
+        Proximity, 
+        (
+            conflict(I, J),
+            I < J, 
+            proximity(X, I, J, Proximity)
+        ), 
+        Proximities
+    ),
+    sumlist(Proximities, ImmediateResult),
+    Result = ImmediateResult + 1. % Avoid zero proximity
+
+fitness(X, Fitness) :-
+    total_proximity(X, TotalProximity),
+    ( TotalProximity > 0 -> 
+        Fitness is 10**5 / TotalProximity 
+    ; 
+        Fitness is 0  % Handle the case where no valid proximity exists
+    ).
+
+score_population(P, FitnessList) :-
+    maplist(fitness, P, FitnessList), !.
+
+% Population
+generate_population(Population) :-
+    config(population_size, Size),
+    generate_population(Population, Size).
+
+generate_population(_, 0) :- !.
+
+generate_population([Specimen | Rest] , Size) :-
+    specimen(Specimen),
+    NewSize is Size - 1,
+    generate_population(Rest, NewSize),
+    !.
+
+% Tournament Selection
+tournament(Population, TournamentSize, FitnessList, Winners) :-
+    findall(Winner, (between(1, TournamentSize, _), fight(Population, FitnessList, Winner)), Winners), !.
+
+fight(Population, FitnessList, Winner) :-    
+    length(Population, PopulationSize),    
+    random_between(1, PopulationSize, Index1),
+    random_between(1, PopulationSize, Index2),
+    nth1(Index1, Population, Specimen1),
+    nth1(Index2, Population, Specimen2),
+    nth1(Index1, FitnessList, Fitness1),
+    nth1(Index2, FitnessList, Fitness2),
+    (Fitness1 > Fitness2 -> Winner = Specimen1; Winner = Specimen2).
+
+% Crossover - sawpping a random number of slots between two parents to create two feasible children
+
+crossover_population([], _) :- !.
+crossover_population([Parent1, Parent2 | ParentsRest], [Child1, Child2 | ChildrenRest]) :- 
+    crossover(Parent1, Parent2, Child1, Child2),
+    crossover_population(ParentsRest, ChildrenRest), !.
+
+crossover_population([Parent], Rest) :-
+    Rest = [Parent], !.
+
+crossover(Parent1, Parent2, Child1, Child2) :-
+    config(crossover_rate, Rate),
+    random(Rand),
+    (Rand < Rate -> 
+        do_crossover(Parent1, Parent2, Child1, Child2)
+    ; 
+        Child1 = Parent1, 
+        Child2 = Parent2
+    ).
+
+do_crossover(Parent1, Parent2, Child1, Child2) :-
+    length(Parent1, Length),
+    NumSwaps is Length // 2, 
+    crossover_loop(Parent1, Parent2, NumSwaps, Child1, Child2).
+    
+
+crossover_loop(Parent1, Parent2, 0, Child1, Child2) :- 
+    Child1 = Parent1, 
+    Child2 = Parent2, !.
+
+crossover_loop(Parent1, Parent2, NumSwaps, Child1, Child2) :-
+    length(Parent1, Length),
+    random_between(1, Length, N),
+    swap_nth_element(Parent1, Parent2, N, Potential1, Potential2),
+    NewNumSwaps is NumSwaps - 1,
+    
+    (specimen(Potential1) -> Next1 = Potential1 ; Next1 = Parent1),
+    (specimen(Potential2) -> Next2 = Potential2 ; Next2 = Parent2),
+               
+    crossover_loop(Next1, Next2, NewNumSwaps, Child1, Child2).
+
+        
+swap_nth_element([H1|T1], [H2|T2], 1, [H2|T1], [H1|T2]).
+swap_nth_element([H1|T1], [H2|T2], N, [H1|R1], [H2|R2]) :-
+    N > 1,
+    N1 is N - 1,
+    swap_nth_element(T1, T2, N1, R1, R2).
+
+% Mutation - randomly change the slot of a random course until a feasible solution is found
+
+mutate_population([], []) :- !.
+mutate_population([Specimen | Rest], [Mutated | MutatedRest]) :- % mutate_population(Selected, Mutated)
+    mutate(Specimen, Mutated),
+    mutate_population(Rest, MutatedRest), !.
+
+mutate(Specimen, Mutated) :-
+    config(mutation_rate, Rate),
+    random(Rand),
+    (Rand < Rate -> 
+        do_mutate(Specimen, Mutated)
+    ; 
+        Mutated = Specimen
+    ).
+
+do_mutate(Specimen, Mutated) :-
+    config(slots, NumSlots),
+    length(Specimen, Length),
+    random_between(1, NumSlots, Slot),
+    random_between(1, Length, Index),
+    replace_nth(Index, Specimen, Slot, Mutated),
+    specimen(Mutated) -> true; do_mutate(Specimen, Mutated).
+
+
+replace_nth(1, [ _ | Tail], NewValue, [NewValue | Tail]).
+replace_nth(N, [Head | Tail], NewValue, [Head | Result]) :-
+    N > 1,
+    N1 is N - 1,
+    replace_nth(N1, Tail, NewValue, Result).
+   
+% Genetic operations
+
+genetic_operations(Population, Mutated) :-
+    crossover_population(Population, Children),
+    mutate_population(Children, Mutated).
+
+% Succession
+elite(Population, FitnessList, EliteSize, Elite) :- 
+    sort_population(Population, FitnessList, SortedPopulation),
+    length(Elite, EliteSize),
+    prefix(Elite, SortedPopulation).
+
+sort_population(Population, FitnessList, SortedPopulation) :-
+    pairs_keys_values(Pairs, FitnessList, Population),
+    keysort(Pairs, SortedPairs),
+    pairs_keys_values(SortedPairs, _, SortedPopulationReverse),
+    reverse(SortedPopulationReverse, SortedPopulation).
+
+succession(Population, Mutated, PopulationFitnessList, MutatedFitnessList, NewPopulation) :-
+    config(elitism_rate, Rate),
+    length(Population, PopulationSize),
+    EliteSize is round(PopulationSize * Rate),
+    elite(Population, PopulationFitnessList, EliteSize, Elite),
+    length(Population, PopulationSize),
+    MutatedSize is PopulationSize - EliteSize,
+    sort_population(Mutated, MutatedFitnessList, SortedMutated),
+    length(Winners, MutatedSize),
+    prefix(Winners, SortedMutated),
+    append(Elite, Winners, NewPopulation).
+
+% Genetic Algorithm
+
+genetic_algorithm(BestSchedule) :-
+    generate_population(Population),
+    genetic_algorithm(Population, 1, 0, _, BestSchedule), !.
+
+genetic_algorithm(_, Generation, _, CurrentBestSchedule, BestSchedule) :-
+    config(generations, Generations),
+    Generation > Generations,
+    BestSchedule = CurrentBestSchedule, !.
+
+genetic_algorithm(Population, Generation, CurrentBestFitness, CurrentBestSchedule, BestSchedule) :-
+    config(generations, Generations),
+    length(Population, PopulationSize),
+    Generation =< Generations,
+    score_population(Population, FitnessList),
+    tournament(Population, PopulationSize, FitnessList, Selected),
+    genetic_operations(Selected, Mutated),
+    score_population(Mutated, MutatedFitnessList),
+    sort_population(Mutated, MutatedFitnessList, SortedMutated),
+    nth1(1, SortedMutated, LocalBestSchedule),
+    nth1(1, MutatedFitnessList, LocalBestFitness),
+    NewGeneration is Generation + 1,
+    (
+        LocalBestFitness > CurrentBestFitness -> 
+            (NewBestFitness = LocalBestFitness, NewBestSchedule = LocalBestSchedule); 
+            (NewBestFitness = CurrentBestFitness, NewBestSchedule = CurrentBestSchedule)
+    ),
+    format('Generation ~w: Best fitness ~w~n', [Generation, NewBestFitness]),
+    succession(Population, Mutated, FitnessList, MutatedFitnessList, NewPopulation),
+    genetic_algorithm(NewPopulation, NewGeneration, NewBestFitness, NewBestSchedule, BestSchedule).
+
+% Interface ----------------------------------------------------------------------
+:- dynamic course_name/2. % course_name(Course, Name)
+
+read_conflict_matrix :- 
+    config(conflict_matrix_file, File),
+    csv_read_file(File, Rows, [functor(row), separator(0'\t)]),
+    parse_conflict_matrix(Rows).
+
+parse_conflict_matrix(Rows) :-
+    findall(_, (nth1(I, Rows, Row), parse_row(I, Row)), _).
+
+parse_row(I, Row) :-
+    Row =.. [row | Cols],
+    nth1(J, Cols, NumStudents),
+    set_conflict(I, J, NumStudents),
+    fail; true.
+
+read_course_names :-
+    config(course_names_file, File),
+    csv_read_file(File, Rows, [functor(row), separator(0'\t)]),
+    parse_course_names(Rows).
+
+parse_course_names(Rows) :-
+    findall(_, (nth1(I, Rows, Row), parse_course_name(I, Row)), _).
+
+parse_course_name(I, Row) :-
+    Row =.. [row | Cols],
+    nth1(1, Cols, Name),
+    assertz(course_name(I, Name)),
+    fail; true.
+
+write_schedule_table_to_csv(File, Schedule) :-
+    config(course_number, NumCourses),
+    config(slots, NumSlots),
+    findall(Name, (between(1, NumCourses, Course), course_name(Course, Name)), CourseNames),
+    create_table(CourseNames, Schedule, NumSlots, TableRows),
+    numlist(1, NumSlots, SlotHeaders),
+    Header = ['Course' | SlotHeaders],
+    convert_to_rows([Header | TableRows], Table),
+    csv_write_file(File, Table).
+
+
+convert_to_rows([], []). 
+convert_to_rows([Sublist|Rest], [RowTerm|RestTerm]) :-
+    RowTerm =.. [row|Sublist],
+    convert_to_rows(Rest, RestTerm). 
+
+create_table(CourseNames, Schedule, NumSlots, TableRows) :-
+    maplist(row_for_course(NumSlots), CourseNames, Schedule, TableRows).
+
+row_for_course(NumSlots, Name, Slot, [Name | Entries]) :-
+    numlist(1, NumSlots, Slots),
+    maplist(slot_entry(Slot), Slots, Entries).
+
+slot_entry(Slot, Slot, 'x').
+slot_entry(_, _, ' ').
+
+initialize :-
+    read_conflict_matrix,
+    read_course_names,
+    genetic_algorithm(BestSchedule),
+    write_schedule_table_to_csv('schedule.csv', BestSchedule).
+
+:- initialization(initialize).
+
